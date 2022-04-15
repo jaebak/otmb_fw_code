@@ -9,8 +9,8 @@ use unisim.vcomponents.all;
 
 entity odmb_device is
   port (
-    clock        : in std_logic;
-    clock_vme    : in std_logic;
+    clock        : in std_logic; --40MHz
+    clock_vme    : in std_logic; --10Mhz
     global_reset : in std_logic;
     ccb_l1accept : in std_logic;
     ccb_evcntres : in std_logic;
@@ -71,6 +71,16 @@ architecture odmb_device_arch of odmb_device is
       );
   end component;
 
+  component PRBS_GEN is
+    port (
+      DOUT : out std_logic;
+
+      CLK    : in std_logic;
+      RST    : in std_logic;
+      ENABLE : in std_logic
+      );
+  end component;
+
   signal otmb_data, alct_data         : std_logic_vector(15 downto 0);
   signal eof_otmb_data, eof_alct_data : std_logic_vector(17 downto 0) := (others => '1');
 
@@ -100,6 +110,16 @@ architecture odmb_device_arch of odmb_device is
   signal   nwords_dummy, nwords_dummy_rst, nwords_dummy_pre : std_logic_vector(15 downto 0);
   signal   w_nwords_dummy, r_nwords_dummy                   : std_logic;
 
+  constant n_prbs_def                     : std_logic_vector(15 downto 0) := x"0008";
+  signal   n_prbs_rst, n_prbs_pre         : std_logic_vector(15 downto 0);
+  signal   n_prbs                         : std_logic_vector(15 downto 0);
+  signal   w_otmb_prbs_tx, w_otmb_prbs_tx_q, w_otmb_prbs_tx_qq, r_otmb_prbs_tx : std_logic;
+  signal   pulse_otmb_prbs_tx_en          : std_logic;
+  signal   otmb_prbs_tx                   : std_logic;
+  signal   otmb_prbs_tx_en_b              : std_logic;
+  signal   pulse_otmb_prbs_tx_end         : std_logic;
+  signal   otmb_prbs_tx_rst               : std_logic;
+
   constant logich   : std_logic                    := '1';
   constant otmb_dly : std_logic_vector(4 downto 0) := "00100";
   constant alct_dly : std_logic_vector(4 downto 0) := "01000";
@@ -112,13 +132,18 @@ begin
   w_data_rqst    <= '1' when (cmddev = x"111EE" and is_read = '0') else '0';
   w_nwords_dummy <= '1' when (cmddev = x"121EE" and is_read = '0') else '0';
   r_nwords_dummy <= '1' when (cmddev = x"121EE" and is_read = '1') else '0';
+  w_otmb_prbs_tx <= '1' when (cmddev = x"131EE" and is_read = '0') else '0';
+  FD_w_otmb_prbs_tx_q : FDC port map(Q=>w_otmb_prbs_tx_q, C=>clock, CLR=>global_reset, D=>w_otmb_prbs_tx);
+  FD_w_otmb_prbs_tx_qq : FDC port map(Q=>w_otmb_prbs_tx_qq, C=>clock, CLR=>global_reset, D=>w_otmb_prbs_tx_q);
+  r_otmb_prbs_tx <= '1' when (cmddev = x"131EE" and is_read = '1') else '0';
 
   odmb_data <= out_odmb_sel when r_odmb_sel = '1' else
                nwords_dummy when r_nwords_dummy = '1' else
+               n_prbs when r_otmb_prbs_tx = '1' else
                x"DBDB";
 
   -- ODMB_SEL
-  FD_ODMB_SEL : FDC port map(odmb_sel_inner, w_odmb_sel, global_reset, vme_data(0));
+  FD_ODMB_SEL : FDC port map(Q=>odmb_sel_inner, C=>w_odmb_sel, CLR=>global_reset, D=>vme_data(0));
   out_odmb_sel(15 downto 1) <= (others => '0');
   out_odmb_sel(0)           <= odmb_sel_inner;
   odmb_sel                  <= odmb_sel_inner;
@@ -128,9 +153,21 @@ begin
   begin
     nwords_dummy_pre(I) <= global_reset when nwords_dummy_def(I) = '1' else '0';
     nwords_dummy_rst(I) <= global_reset when nwords_dummy_def(I) = '0' else '0';
-    FD_W_NWORDS_DUMMY : FDCP port map(nwords_dummy(I), w_nwords_dummy,
-                                      nwords_dummy_rst(I), vme_data(I), nwords_dummy_pre(I));
+    FD_W_NWORDS_DUMMY : FDCP port map(Q=>nwords_dummy(I), C=>w_nwords_dummy,
+                                      CLR=>nwords_dummy_rst(I), D=>vme_data(I), PRE=>nwords_dummy_pre(I));
   end generate GEN_NWORDS_DUMMY;
+
+  -- PRBS generator
+  GEN_N_PRBS : for I in 15 downto 0 generate
+    FD_W_N_PRBS : FDC port map(Q=>n_prbs(I), C=>w_otmb_prbs_tx_qq, CLR=>global_reset, D=>vme_data(I)); -- Q, C, CLR, D
+  end generate GEN_N_PRBS;
+  PE_OTMB_PRBS_TX_EN : PULSE_EDGE port map(pulse_otmb_prbs_tx_en, open, clock, global_reset, to_integer(unsigned(n_prbs))*10000, w_otmb_prbs_tx_qq);
+  GEN_PRBS_DATA : PRBS_GEN port map(otmb_prbs_tx, clock, otmb_prbs_tx_rst, pulse_otmb_prbs_tx_en);
+  dmb_tx_odmb_inner <= (48 => pulse_otmb_prbs_tx_en, others => otmb_prbs_tx);
+  -- Reset prbs_gen signals after test is finished
+  otmb_prbs_tx_en_b <= not pulse_otmb_prbs_tx_en;
+  PULSEOTMB_TX_RST : PULSE_EDGE port map (DOUT => pulse_otmb_prbs_tx_end, PULSE1 => open, CLK => clock, RST => global_reset, NPULSE => 32, DIN => otmb_prbs_tx_en_b);
+  otmb_prbs_tx_rst  <= pulse_otmb_prbs_tx_end or global_reset;
 
   -- Data generation
   PULSE_DATARQST : PULSE_EDGE port map(pulse_data_rqst, open, clock, global_reset, 1, w_data_rqst);
@@ -141,11 +178,10 @@ begin
   SRL32_OTMBDAV : SRLC32E port map(otmb_dav, open, otmb_dly, logich, clock, l1a_match(8));
   SRL32_ALCTDAV : SRLC32E port map(alct_dav, open, alct_dly, logich, clock, l1a_match(9));
 
-  dmb_tx_odmb_inner <= dmb_tx_reserved & lct(7 downto 6) & alct_dav & eof_alct_data(16 downto 15) &
-                 eof_alct_data_valid_b & lct(5 downto 0) & eof_otmb_data_valid_b & otmb_dav &
-                 eof_otmb_data(16 downto 15) & eof_alct_data(14 downto 0) &
-                 eof_otmb_data(14 downto 0);
-
+  --dmb_tx_odmb_inner <= dmb_tx_reserved & lct(7 downto 6) & alct_dav & eof_alct_data(16 downto 15) &
+  --               eof_alct_data_valid_b & lct(5 downto 0) & eof_otmb_data_valid_b & otmb_dav &
+  --               eof_otmb_data(16 downto 15) & eof_alct_data(14 downto 0) &
+  --               eof_otmb_data(14 downto 0);
   GEN_DMB_TX : for I in 48 downto 0 generate
     FDDMBTX : FD port map(dmb_tx_odmb(I), clock, dmb_tx_odmb_inner(I));
   end generate GEN_DMB_TX;
